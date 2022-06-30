@@ -51,3 +51,6 @@ EDIT:
 - Update according YOLOv5 v6.0 release
 
 If you have further question, plz ask in https://github.com/ultralytics/yolov5/pull/1127
+
+## Reference:
+https://github.com/hunglc007/tensorflow-yolov4-tflite.git
