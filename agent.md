@@ -299,6 +299,10 @@ quantitative parity comparisons (loss curves, op histograms, mAP), see
 | **Phase 5 — residual val_obj +15% gap** | sustained TF > PT delta on val obj loss; worth investigating only if 30+ epoch run shows TF mAP materially below PT |
 | ~~Mixed precision (AMP) for GPU training~~ | ✅ implemented (`--amp` flag in train_tf.py; no-op on CPU, activates `mixed_float16` policy + 1024× loss scale on GPU) |
 | ~~Multi-scale training~~ | ✅ implemented (`--multi-scale` flag in train_tf.py; rebuilds model with `dynamic_shape=True` so `TFUpsample` uses `tf.shape(x)` at runtime; per-batch random imgsz in `[0.5, 1.5]·imgsz`) |
+| ~~detect_tf.py extensions~~ | ✅ `--save-crop` (per-class folders), `--classes` filter, `--agnostic-nms` |
+| ~~--save-json (COCO predictions)~~ | ✅ in `tf_validate(save_json=True)` and `val_tf.py --save-json` |
+| ~~val_tf.py --task speed~~ | ✅ batch-1 latency benchmark (mean / p50 / p95 / FPS) |
+| ~~val_tf.py --task study~~ | ✅ imgsz sweep with mAP + ms/img + FPS table |
 | Image weights | default off, niche |
 | `--evolve` hyperparameter GA | research workflow, separate |
 | `--save-json` (COCO predictions) | only needed for benchmark COCO official |
