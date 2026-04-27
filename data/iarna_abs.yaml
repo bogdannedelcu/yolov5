@@ -1,0 +1,6 @@
+path: /home/bogdan/work/yolo/iarna/my_dataset/detect
+train: images/train
+val: images/val
+
+names:
+  0: persoana
