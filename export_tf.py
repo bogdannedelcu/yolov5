@@ -42,6 +42,44 @@ def parse_imgsz(values):
     raise ValueError("--imgsz takes 1 or 2 values (H W)")
 
 
+def _p_from_stride(s):
+    """Map stride to feature pyramid level name (P2, P3, P4, ...)."""
+    return {4: "p2", 8: "p3", 16: "p4", 32: "p5", 64: "p6", 128: "p7"}.get(
+        int(s), f"s{int(s)}"
+    )
+
+
+def make_output_names(strides):
+    """Descriptive output names: e.g. ['raw_p2_stride4', 'raw_p3_stride8', ...]."""
+    return [f"raw_{_p_from_stride(s)}_stride{int(s)}" for s in strides]
+
+
+def _wrap_named_outputs(model, output_names, img_hw, batch_size=1,
+                        input_name="rgb_uint8_image"):
+    """Wrap a Keras model into a tf.function with a named-output signature.
+
+    TFLite preserves the input arg name and the dict keys → tensors appear as
+    `rgb_uint8_image` (input) and `raw_p3_stride8`, `raw_p4_stride16`, ...
+    (outputs) instead of `serving_default_images:0` / `StatefulPartitionedCall:N`.
+    """
+    H, W = img_hw
+
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=(batch_size, H, W, 3), dtype=tf.float32, name=input_name)
+    ])
+    def serving_fn(rgb_uint8_image):
+        outs = model(rgb_uint8_image, training=False)
+        if not isinstance(outs, (list, tuple)):
+            outs = [outs]
+        # tf.identity with name= persists the desired name through the
+        # TFLite converter (dict keys alone get rewritten to StatefulPartitionedCall:N).
+        return {name: tf.identity(out, name=name)
+                for name, out in zip(output_names, outs)}
+
+    serving_fn.__name__ = "serving_fn"
+    return serving_fn
+
+
 def random_dataset(img_hw, n=100, seed=0):
     rng = np.random.default_rng(seed)
     H, W = img_hw
@@ -53,25 +91,49 @@ def random_dataset(img_hw, n=100, seed=0):
     return gen
 
 
-def quantize_to_tflite(model, img_hw, out_path: Path, calib_gen=None, n_calib=100, seed=0):
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+def quantize_to_tflite(model, img_hw, out_path: Path, calib_gen=None, n_calib=100,
+                       seed=0, in_type="uint8", out_type="int8",
+                       output_names=None, input_name="rgb_uint8_image"):
+    """INT8-quantize a Keras model to TFLite.
+
+    `in_type` / `out_type` control the I/O dtype: "uint8" (Coral-friendly)
+    or "int8". Internal arithmetic is always int8 (TFLITE_BUILTINS_INT8).
+
+    `output_names` (list of str, one per scale) and `input_name` are used to
+    rename the TFLite I/O tensors via a `tf.function` wrapper.
+    """
+    if output_names is not None:
+        serving_fn = _wrap_named_outputs(model, output_names, img_hw,
+                                         batch_size=1, input_name=input_name)
+        cf = serving_fn.get_concrete_function()
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], model)
+    else:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = calib_gen if calib_gen is not None \
         else random_dataset(img_hw, n=n_calib, seed=seed)
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.uint8
-    converter.inference_output_type = tf.int8
+    type_map = {"uint8": tf.uint8, "int8": tf.int8}
+    converter.inference_input_type = type_map[in_type]
+    converter.inference_output_type = type_map[out_type]
     tflite_bytes = converter.convert()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(tflite_bytes)
     return out_path
 
 
-def fp16_to_tflite(model, out_path: Path):
+def fp16_to_tflite(model, out_path: Path, img_hw=None,
+                   output_names=None, input_name="rgb_uint8_image"):
     """Half-precision TFLite (no calibration needed). Larger than INT8 but
     closer to fp32 accuracy. Mirrors PT export's `--half` TFLite path.
     """
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    if output_names is not None and img_hw is not None:
+        serving_fn = _wrap_named_outputs(model, output_names, img_hw,
+                                         batch_size=1, input_name=input_name)
+        cf = serving_fn.get_concrete_function()
+        converter = tf.lite.TFLiteConverter.from_concrete_functions([cf], model)
+    else:
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.target_spec.supported_types = [tf.float16]
     tflite_bytes = converter.convert()
@@ -80,10 +142,17 @@ def fp16_to_tflite(model, out_path: Path):
     return out_path
 
 
-def saved_model_export(model, out_dir: Path):
+def saved_model_export(model, out_dir: Path, img_hw=None,
+                       output_names=None, input_name="rgb_uint8_image"):
     """Export TF SavedModel (full graph fp32, no quantization)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    tf.saved_model.save(model, str(out_dir))
+    if output_names is not None and img_hw is not None:
+        serving_fn = _wrap_named_outputs(model, output_names, img_hw,
+                                         batch_size=1, input_name=input_name)
+        tf.saved_model.save(model, str(out_dir),
+                            signatures={"serving_default": serving_fn.get_concrete_function()})
+    else:
+        tf.saved_model.save(model, str(out_dir))
     return out_dir
 
 
@@ -140,7 +209,10 @@ def main():
     ap.add_argument("--imgsz", nargs="+", help="H or H W (required if --weights without sidecar)")
     ap.add_argument("--nc", type=int, default=None)
     ap.add_argument("--act", default="silu", choices=["silu", "swish", "relu", "relu6", "leaky"])
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None,
+                    help="output dir; if omitted and --weights is given, defaults to "
+                         "<weights_parent>/export_<out_type>_<HxW> (export stays paired "
+                         "with the trained model on disk)")
     ap.add_argument("--n-calib", type=int, default=100)
     ap.add_argument("--data", default=None,
                     help="data.yaml — calibration set built from train split")
@@ -151,12 +223,13 @@ def main():
                     default=["tflite_int8", "edgetpu"],
                     choices=["tflite_int8", "tflite_fp16", "saved_model", "edgetpu", "keras"],
                     help="formats to export (default: INT8 TFLite + EdgeTPU)")
+    ap.add_argument("--in-type", default="uint8", choices=["uint8", "int8"],
+                    help="TFLite input dtype (default uint8, Coral-friendly)")
+    ap.add_argument("--out-type", default="int8", choices=["uint8", "int8"],
+                    help="TFLite output dtype (default int8; use uint8 for Coral parity)")
     args = ap.parse_args()
     if args.no_edgetpu and "edgetpu" in args.include:
         args.include = [x for x in args.include if x != "edgetpu"]
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.weights:
         wp = Path(args.weights)
@@ -198,19 +271,62 @@ def main():
     for o in model.outputs:
         print(f"[build]   output {o.name}: shape={o.shape}")
 
+    # Build a descriptive run_tag and resolve out_dir.
+    # `run_tag` is used as a filename prefix so all artefacts (tflite, log,
+    # saved_model dir, copied cfg.yaml and architecture.json) carry the same
+    # identifier and stay self-describing once moved out of their folder.
+    H, W = img_hw
+    if args.weights:
+        run_name = Path(args.weights).parent.name
+    else:
+        run_name = Path(args.cfg).stem
+    if args.in_type != "uint8":
+        run_tag = f"{run_name}_{args.in_type}in_{args.out_type}_{H}x{W}"
+    else:
+        run_tag = f"{run_name}_{args.out_type}_{H}x{W}"
+
+    if args.out is not None:
+        out_dir = Path(args.out)
+    elif args.weights:
+        out_dir = Path(args.weights).parent / f"export_{args.out_type}_{H}x{W}"
+    else:
+        raise SystemExit("--out is required when --weights is not given")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[out]   {out_dir}  (run_tag={run_tag})")
+
+    # Copy config YAML + architecture.json sidecar next to artefacts so the
+    # export folder is self-contained (can be moved/uploaded as one unit).
+    # The YAML is renamed to `{run_tag}.yaml` so it pairs visually with the
+    # `{run_tag}_int8.tflite` / `{run_tag}_int8_edgetpu.tflite` artefacts.
+    import shutil as _shutil
+    cfg_path = Path(args.cfg)
+    if cfg_path.exists():
+        cfg_dst = out_dir / f"{run_tag}.yaml"
+        _shutil.copy(cfg_path, cfg_dst)
+        print(f"[copy]  {cfg_dst.name}  (from {cfg_path.name})")
+    if args.weights:
+        sidecar_src = Path(args.weights).parent / "architecture.json"
+        if sidecar_src.exists():
+            sidecar_dst = out_dir / f"{run_tag}_architecture.json"
+            _shutil.copy(sidecar_src, sidecar_dst)
+            print(f"[copy]  {sidecar_dst.name}")
+
     if "keras" in args.include:
-        keras_path = out_dir / "model.keras"
+        keras_path = out_dir / f"{run_tag}.keras"
         model.save(keras_path)
         print(f"[save]  {keras_path}")
 
+    output_names = make_output_names(strides)
+    print(f"[names] input='rgb_uint8_image'  outputs={output_names}")
+
     if "saved_model" in args.include:
-        sm_dir = out_dir / "saved_model"
-        saved_model_export(model, sm_dir)
+        sm_dir = out_dir / f"{run_tag}_saved_model"
+        saved_model_export(model, sm_dir, img_hw=img_hw, output_names=output_names)
         print(f"[save]  {sm_dir}/  (SavedModel fp32)")
 
     if "tflite_fp16" in args.include:
-        fp16_path = out_dir / "detector_fp16.tflite"
-        fp16_to_tflite(model, fp16_path)
+        fp16_path = out_dir / f"{run_tag}_fp16.tflite"
+        fp16_to_tflite(model, fp16_path, img_hw=img_hw, output_names=output_names)
         size_mb = fp16_path.stat().st_size / (1024 * 1024)
         print(f"[save]  {fp16_path} ({size_mb:.2f} MB, fp16)")
 
@@ -231,9 +347,11 @@ def main():
     else:
         print("[quant] no --data / --calib-images given; using random calibration")
 
-    print(f"[quant] INT8 quantize (uint8 in, int8 out, n_calib={args.n_calib})")
-    tflite_path = out_dir / "detector_int8.tflite"
-    quantize_to_tflite(model, img_hw, tflite_path, calib_gen=calib_gen, n_calib=args.n_calib)
+    print(f"[quant] INT8 quantize ({args.in_type} in, {args.out_type} out, n_calib={args.n_calib})")
+    tflite_path = out_dir / f"{run_tag}_int8.tflite"
+    quantize_to_tflite(model, img_hw, tflite_path, calib_gen=calib_gen,
+                       n_calib=args.n_calib, in_type=args.in_type, out_type=args.out_type,
+                       output_names=output_names)
     size_mb = tflite_path.stat().st_size / (1024 * 1024)
     print(f"[quant] {tflite_path} ({size_mb:.2f} MB)")
 
@@ -247,7 +365,7 @@ def main():
 
     print("[edgetpu] running edgetpu_compiler...")
     compiled, log = run_edgetpu_compiler(tflite_path)
-    log_path = out_dir / "edgetpu_compile.log"
+    log_path = out_dir / f"{run_tag}_edgetpu_compile.log"
     log_path.write_text(log)
     summary = parse_compiler_summary(log)
     print(f"[edgetpu] log -> {log_path}")

@@ -1,0 +1,62 @@
+# YOLOv5n adapted for the `iarna` dataset — small output footprint variant.
+#
+# Compromise between the P2-P4 head (highest recall on small objects, but
+# 148 KiB output footprint) and the standard P3-P5 (smaller output but
+# wastes P5 receptive field on iarna's max-57 px objects):
+#
+#   1. First conv kernel reduced from 6 to 3 (less early blur on small
+#      24 px median targets).
+#
+#   2. Detect head moved from (P3/8, P4/16, P5/32) to (P3/8, P4/16).
+#      Reasoning:
+#       - P5/32 (32×32 cell) is larger than the largest iarna object
+#         (max ≈ 57 px) — receptive field wasted.
+#       - Drop P2/4 (it is what blew up the output footprint of the
+#         P2-P4 variant) but keep P3/8 which still gives a 24 px object
+#         3×3 = 9 grid cells — sufficient for matching with offset bias.
+#       - Backbone stops at P4 (drops 1024-ch C3 + last stride-2 layer),
+#         SPPF applied at 512 channels on P4 feature map.
+#
+# Output footprint at imgsz=480×640 (na=1, nc=1, 6 channels per cell):
+#   P3/8    60× 80×6 =  28,800 B
+#   P4/16   30× 40×6 =   7,200 B
+#   total            =  36,000 B  (~35 KiB)
+#
+# That is **4.2× smaller** than the P2-P4 variant (151,200 B) and
+# **22× smaller** than na=3 nc=80 standard (1,606,500 B). The reduced
+# spatial coverage at P3 (vs P2) is the documented accuracy tradeoff.
+
+nc: 1
+depth_multiple: 0.33
+width_multiple: 0.25
+
+anchors:
+  - [16, 16]   # P3/8  — small targets (auto-tuned)
+  - [32, 32]   # P4/16 — medium targets (auto-tuned)
+
+# Backbone: stop at P4 (no P5/32 layers), with smaller k=3 first conv.
+backbone:
+  [
+    [-1, 1, Conv, [64, 3, 2, 1]],   # 0-P1/2  (k=3, was k=6)
+    [-1, 1, Conv, [128, 3, 2]],     # 1-P2/4
+    [-1, 3, C3, [128]],             # 2
+    [-1, 1, Conv, [256, 3, 2]],     # 3-P3/8   ← P3 saved for head
+    [-1, 6, C3, [256]],             # 4
+    [-1, 1, Conv, [512, 3, 2]],     # 5-P4/16  ← P4 saved for head
+    [-1, 9, C3, [512]],             # 6
+    [-1, 1, SPPF, [512, 5]],        # 7        top-of-pyramid
+  ]
+
+# Head: FPN (P4 → P3) and PAN (P3 → P4); Detect on (P3, P4).
+head: [
+    [-1, 1, Conv, [256, 1, 1]],                  # 8   reduce P4
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],  # 9   P4 → P3 spatial
+    [[-1, 4], 1, Concat, [1]],                   # 10  cat backbone P3
+    [-1, 3, C3, [256, False]],                   # 11  (P3/8-small) DETECT
+
+    [-1, 1, Conv, [256, 3, 2]],                  # 12  P3 → P4 spatial
+    [[-1, 8], 1, Concat, [1]],                   # 13  cat reduced P4
+    [-1, 3, C3, [512, False]],                   # 14  (P4/16-medium) DETECT
+
+    [[11, 14], 1, Detect, [nc, anchors]],        # 15  Detect(P3, P4)
+  ]

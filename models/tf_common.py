@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
@@ -182,6 +183,208 @@ class TFConcat(keras.layers.Layer):
 
     def call(self, inputs):
         return tf.concat(inputs, axis=-1)
+
+
+class TFC2f(keras.layers.Layer):
+    """C2f from YOLOv8 — split + N bottlenecks each chained, all concatenated.
+
+    Drop-in replacement for C3. Better gradient flow (each bottleneck output
+    is concatenated, not just the final) at marginally more channel ops.
+    """
+
+    def __init__(self, c1, c2, n=1, shortcut=True, e=0.5, act="silu", **kw):
+        super().__init__(**kw)
+        self.c_ = int(c2 * e)
+        self.cv1 = TFConv(2 * self.c_, 1, 1, act=act)
+        self.cv2 = TFConv(c2, 1, 1, act=act)
+        self.m = [TFBottleneck(self.c_, self.c_, shortcut, e=1.0, act=act) for _ in range(n)]
+
+    def call(self, x, training=False):
+        y = tf.split(self.cv1(x, training=training), 2, axis=-1)
+        y = list(y)
+        for b in self.m:
+            y.append(b(y[-1], training=training))
+        return self.cv2(tf.concat(y, axis=-1), training=training)
+
+
+class TFGELAN(keras.layers.Layer):
+    """GELAN block (YOLOv9) — Generalized Efficient Layer Aggregation.
+
+    Same shape as ELAN/CSP but with cleaner gradient pathways: split input
+    into 2 halves, run a chain of bottlenecks on the second half collecting
+    intermediate features, concat all (initial halves + each intermediate)
+    and project. EdgeTPU-friendly: pure Conv + Concat + Add (via shortcut).
+    """
+
+    def __init__(self, c1, c2, n=1, shortcut=True, e=0.5, act="silu", **kw):
+        super().__init__(**kw)
+        self.c_ = int(c2 * e)
+        self.cv1 = TFConv(2 * self.c_, 1, 1, act=act)
+        # Two chained bottlenecks per "step", n steps. Equivalent to
+        # GELAN's "block" wrapping ELAN's gradient flow.
+        self.m = [
+            [TFBottleneck(self.c_, self.c_, shortcut, e=1.0, act=act) for _ in range(2)]
+            for _ in range(n)
+        ]
+        self.cv2 = TFConv(c2, 1, 1, act=act)
+
+    def call(self, x, training=False):
+        y = list(tf.split(self.cv1(x, training=training), 2, axis=-1))
+        cur = y[-1]
+        for b1, b2 in self.m:
+            cur = b2(b1(cur, training=training), training=training)
+            y.append(cur)
+        return self.cv2(tf.concat(y, axis=-1), training=training)
+
+
+class TFPConv(keras.layers.Layer):
+    """Partial Convolution (FasterNet, CVPR 2023).
+
+    Operates conv only on the first `r` channels (default r = c/4),
+    pass-through the rest. ~2× faster than full Conv at small accuracy
+    cost. EdgeTPU-friendly (just Conv + Concat).
+    """
+
+    def __init__(self, c2, k=3, s=1, ratio=0.25, act="silu", **kw):
+        super().__init__(**kw)
+        self.c2 = c2
+        self.ratio = ratio
+        self.k = k
+        self.s = s
+        self.act_name = act
+        self.conv = None  # built lazily after we know c1
+
+    def build(self, input_shape):
+        c1 = int(input_shape[-1])
+        self.c_partial = max(int(c1 * self.ratio), 1)
+        self.c_passthrough = c1 - self.c_partial
+        if self.s == 1:
+            self.pad = None
+            self.conv = keras.layers.Conv2D(
+                filters=self.c_partial, kernel_size=self.k, strides=1,
+                padding="same", use_bias=False, kernel_initializer=PTConvKernelInit(),
+            )
+        else:
+            self.pad = TFPad(autopad(self.k))
+            self.conv = keras.layers.Conv2D(
+                filters=self.c_partial, kernel_size=self.k, strides=self.s,
+                padding="valid", use_bias=False, kernel_initializer=PTConvKernelInit(),
+            )
+        self.bn = keras.layers.BatchNormalization(epsilon=1e-3, momentum=0.97)
+        self.act = act_layer(self.act_name)
+        # final 1x1 to mix back to c2 channels (FasterNet uses two 1x1 around PConv)
+        self.proj = TFConv(self.c2, 1, 1, act=self.act_name)
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        x_p = x[..., : self.c_partial]
+        x_rest = x[..., self.c_partial:]
+        if self.pad is not None:
+            x_p = self.pad(x_p)
+        x_p = self.act(self.bn(self.conv(x_p), training=training))
+        # at stride > 1, x_rest must also be downsampled to match — fall back
+        # to strided slice (simple subsampling) for EdgeTPU compatibility
+        if self.s > 1:
+            x_rest = x_rest[:, :: self.s, :: self.s, :]
+        y = tf.concat([x_p, x_rest], axis=-1)
+        return self.proj(y, training=training)
+
+
+class TFGhost(keras.layers.Layer):
+    """Ghost module (GhostNet, CVPR 2020) — produce more features cheaply.
+
+    Half output channels via standard 1×1 Conv, the other half via cheap
+    DepthwiseConv on the first half (the "ghosts"). EdgeTPU-friendly.
+    """
+
+    def __init__(self, c2, k=1, dw_size=3, ratio=2, act="silu", **kw):
+        super().__init__(**kw)
+        self.c2 = c2
+        self.k = k
+        self.dw_size = dw_size
+        self.ratio = ratio
+        self.act_name = act
+
+    def build(self, input_shape):
+        init_ch = self.c2 // self.ratio
+        new_ch = self.c2 - init_ch
+        self.primary = TFConv(init_ch, k=self.k, s=1, act=self.act_name)
+        self.cheap = keras.Sequential([
+            keras.layers.DepthwiseConv2D(
+                kernel_size=self.dw_size, strides=1, padding="same",
+                use_bias=False, depthwise_initializer=PTConvKernelInit(),
+            ),
+            keras.layers.BatchNormalization(epsilon=1e-3, momentum=0.97),
+            act_layer(self.act_name),
+        ])
+        self.new_ch = new_ch
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        x1 = self.primary(x, training=training)
+        x2 = self.cheap(x1, training=training)[..., : self.new_ch]
+        return tf.concat([x1, x2], axis=-1)
+
+
+class TFMSBlock(keras.layers.Layer):
+    """MS-Block (YOLO-MS, 2023) — multi-scale parallel kernels concat.
+
+    Branches with kernels (1, 3, 5) — different receptive fields collected
+    in parallel and concatenated. Good for varied object scales.
+    """
+
+    def __init__(self, c1, c2, kernels=(1, 3, 5), e=0.5, act="silu", **kw):
+        super().__init__(**kw)
+        n = len(kernels)
+        self.c_ = max(int(c2 * e) // n, 1)
+        self.branches = [TFConv(self.c_, k=k, s=1, act=act) for k in kernels]
+        self.cv_in = TFConv(self.c_ * n, 1, 1, act=act)
+        self.cv_out = TFConv(c2, 1, 1, act=act)
+
+    def call(self, x, training=False):
+        x = self.cv_in(x, training=training)
+        # split equally among branches
+        chunks = tf.split(x, len(self.branches), axis=-1)
+        outs = [b(c, training=training) for b, c in zip(self.branches, chunks)]
+        return self.cv_out(tf.concat(outs, axis=-1), training=training)
+
+
+class TFCoordConvStem(keras.layers.Layer):
+    """CoordConv (Liu et al, NeurIPS 2018) — append normalized x/y channels
+    before the first Conv. Helps localization for small objects.
+
+    Coord grid is pre-computed at build() as a fixed `tf.constant`, so the
+    INT8 quantizer sees it as a constant tensor (not a runtime SHAPE/LINSPACE
+    op) and can fuse the Concat into the Edge TPU partition.
+    """
+
+    def __init__(self, c2, k=3, s=2, p=None, act="silu", **kw):
+        super().__init__(**kw)
+        self.conv = TFConv(c2, k=k, s=s, p=p, act=act)
+        self._grid = None
+
+    def build(self, input_shape):
+        H, W = int(input_shape[1]), int(input_shape[2])
+        # normalized [-1, 1] grid baked as a constant — single-batch, so
+        # batch dim is broadcast at concat time.
+        ys = np.linspace(-1.0, 1.0, H, dtype=np.float32)
+        xs = np.linspace(-1.0, 1.0, W, dtype=np.float32)
+        gy = np.broadcast_to(ys[:, None, None], (H, W, 1)).copy()
+        gx = np.broadcast_to(xs[None, :, None], (H, W, 1)).copy()
+        grid_hw_2 = np.concatenate([gx, gy], axis=-1)             # (H, W, 2)
+        self._grid = tf.constant(grid_hw_2[None, ...], dtype=tf.float32)  # (1, H, W, 2)
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        # tf.concat does NOT broadcast batch dim — must tile the (1,H,W,2)
+        # grid up to match. At export with batch_size=1 the multiplier is
+        # constant 1 and the converter folds the tile into a no-op.
+        bs = tf.shape(x)[0]
+        grid = tf.tile(self._grid, [bs, 1, 1, 1])
+        x_aug = tf.concat([x, grid], axis=-1)
+        return self.conv(x_aug, training=training)
+
+
 
 
 class TFUpsample(keras.layers.Layer):

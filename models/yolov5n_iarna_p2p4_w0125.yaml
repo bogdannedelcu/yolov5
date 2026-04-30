@@ -1,0 +1,74 @@
+# YOLOv5n adapted for the `iarna` dataset with small-object focus.
+#
+# Two structural changes vs. yolov5n.yaml:
+#
+# 1. First conv kernel reduced from 6 to 3 to limit early blurring of small
+#    targets (iarna median object ≈ 24 px at imgsz=640).
+#
+# 2. Detect head moved from (P3/8, P4/16, P5/32) to (P2/4, P3/8, P4/16).
+#    Reasoning:
+#       - P5/32 cell (32×32 px) is larger than the largest iarna object
+#         (max ≈ 57 px), so P5 receptive field is wasted.
+#       - P2/4 cell (4×4 px) gives a 24 px object 6×6 = 36 grid cells of
+#         coverage instead of 3×3 = 9 at P3/8 — much higher localization
+#         precision and far better anchor-match success rate.
+#       - Backbone stops at P4 (drops 1024-ch C3 + last stride-2). SPPF
+#         applied at 512 channels on the P4 feature map.
+#
+# Output footprint at imgsz=480×640 (na=1, nc=1, 6 channels per cell):
+#   P2/4   120×160×6 = 115,200 B
+#   P3/8    60× 80×6 =  28,800 B
+#   P4/16   30× 40×6 =   7,200 B
+#   total            = 151,200 B (~148 KiB)
+#
+# This is ~4× larger than the P3/P4/P5 single-anchor variant, but the higher
+# spatial resolution at P2 is the key lever for improving recall on the
+# 24 px median target size.
+#
+# Auto-anchor (PT train.py default; TF trainer can call kmean_anchors too)
+# will replace the seed values below if BPR < 0.98.
+
+nc: 1
+depth_multiple: 0.33
+width_multiple: 0.125
+
+anchors:
+  - [8, 8]      # P2/4   — tiny targets (auto-tuned)
+  - [16, 16]    # P3/8   — small targets (auto-tuned)
+  - [32, 32]    # P4/16  — medium targets (auto-tuned)
+
+# Backbone: stop at P4 (no P5/32 layers), with smaller k=3 first conv.
+backbone:
+  [
+    [-1, 1, Conv, [64, 3, 2, 1]],   # 0-P1/2  (k=3, was k=6)
+    [-1, 1, Conv, [128, 3, 2]],     # 1-P2/4
+    [-1, 3, C3, [128]],             # 2       ← P2 saved for head
+    [-1, 1, Conv, [256, 3, 2]],     # 3-P3/8
+    [-1, 6, C3, [256]],             # 4       ← P3 saved for head
+    [-1, 1, Conv, [512, 3, 2]],     # 5-P4/16
+    [-1, 9, C3, [512]],             # 6       ← P4 saved for head
+    [-1, 1, SPPF, [512, 5]],        # 7        top-of-pyramid
+  ]
+
+# Head: FPN (P4→P3→P2) then PAN (P2→P3→P4); Detect on (P2, P3, P4).
+head: [
+    [-1, 1, Conv, [256, 1, 1]],                  # 8   reduce P4
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],  # 9   P4 → P3 spatial
+    [[-1, 4], 1, Concat, [1]],                   # 10  cat backbone P3
+    [-1, 3, C3, [256, False]],                   # 11  P3 fused
+
+    [-1, 1, Conv, [128, 1, 1]],                  # 12  reduce P3
+    [-1, 1, nn.Upsample, [None, 2, "nearest"]],  # 13  P3 → P2 spatial
+    [[-1, 2], 1, Concat, [1]],                   # 14  cat backbone P2
+    [-1, 3, C3, [128, False]],                   # 15  (P2/4-tiny) DETECT
+
+    [-1, 1, Conv, [128, 3, 2]],                  # 16  P2 → P3 spatial
+    [[-1, 12], 1, Concat, [1]],                  # 17  cat reduced P3
+    [-1, 3, C3, [256, False]],                   # 18  (P3/8-small) DETECT
+
+    [-1, 1, Conv, [256, 3, 2]],                  # 19  P3 → P4 spatial
+    [[-1, 8], 1, Concat, [1]],                   # 20  cat reduced P4
+    [-1, 3, C3, [512, False]],                   # 21  (P4/16-medium) DETECT
+
+    [[15, 18, 21], 1, Detect, [nc, anchors]],    # 22  Detect(P2, P3, P4)
+  ]

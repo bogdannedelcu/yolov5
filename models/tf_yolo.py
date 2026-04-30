@@ -22,6 +22,7 @@ from tensorflow import keras
 
 from models.tf_common import (
     TFConv, TFC3, TFSPPF, TFConcat, TFUpsample,
+    TFC2f, TFGELAN, TFPConv, TFGhost, TFMSBlock, TFCoordConvStem,
     PTConvKernelInit, PTConvBiasInit,
     make_divisible,
 )
@@ -89,7 +90,8 @@ def _parse_yaml(yaml_path: Path | str) -> dict:
 def _resolve_module_args(m_str, args, ch, f, gw, ch_mul, nc):
     """Mirror parse_model dim resolution from `models/yolo.py`."""
     out_ch = ch[-1]
-    if m_str in ("Conv", "C3", "SPPF", "MixConv2d"):
+    if m_str in ("Conv", "C3", "SPPF", "MixConv2d", "C2f", "GELAN", "PConv",
+                 "Ghost", "MSBlock", "CoordConv"):
         c1 = ch[f]
         c2 = args[0]
         c2 = make_divisible(c2 * gw, ch_mul)
@@ -168,6 +170,40 @@ def parse_model_tf(
             c1, c2, *rest = new_args
             shortcut = rest[0] if len(rest) > 0 else True
             layer = TFC3(c1=c1, c2=c2, n=n_rep, shortcut=shortcut, act=act, name=f"L{i}_C3")
+            x = layer(x_in)
+        elif m_str == "C2f":
+            c1, c2, *rest = new_args
+            shortcut = rest[0] if len(rest) > 0 else True
+            layer = TFC2f(c1=c1, c2=c2, n=n_rep, shortcut=shortcut, act=act, name=f"L{i}_C2f")
+            x = layer(x_in)
+        elif m_str == "GELAN":
+            c1, c2, *rest = new_args
+            shortcut = rest[0] if len(rest) > 0 else True
+            layer = TFGELAN(c1=c1, c2=c2, n=n_rep, shortcut=shortcut, act=act, name=f"L{i}_GELAN")
+            x = layer(x_in)
+        elif m_str == "PConv":
+            c1, c2, *rest = new_args
+            k = rest[0] if len(rest) > 0 else 3
+            s = rest[1] if len(rest) > 1 else 1
+            ratio = rest[2] if len(rest) > 2 else 0.25
+            layer = TFPConv(c2=c2, k=k, s=s, ratio=ratio, act=act, name=f"L{i}_PConv")
+            x = layer(x_in)
+        elif m_str == "Ghost":
+            c1, c2, *rest = new_args
+            k = rest[0] if len(rest) > 0 else 1
+            layer = TFGhost(c2=c2, k=k, act=act, name=f"L{i}_Ghost")
+            x = layer(x_in)
+        elif m_str == "MSBlock":
+            c1, c2, *rest = new_args
+            kernels = tuple(rest[0]) if len(rest) > 0 else (1, 3, 5)
+            layer = TFMSBlock(c1=c1, c2=c2, kernels=kernels, act=act, name=f"L{i}_MSBlock")
+            x = layer(x_in)
+        elif m_str == "CoordConv":
+            c1, c2, *rest = new_args
+            k = rest[0] if len(rest) > 0 else 3
+            s = rest[1] if len(rest) > 1 else 2
+            p = rest[2] if len(rest) > 2 else None
+            layer = TFCoordConvStem(c2=c2, k=k, s=s, p=p, act=act, name=f"L{i}_CoordConv")
             x = layer(x_in)
         elif m_str == "SPPF":
             c1, c2, *rest = new_args

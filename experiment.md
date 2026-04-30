@@ -1124,6 +1124,95 @@ the effort.
 
 ---
 
+## Update: Architectural block variants (P3-P4 head, small output) — 2026-04-28
+
+### Goal
+After confirming P3-P4 keeps the output footprint small (~35 KiB at 480x640
+vs 148 KiB for P2-P4), we explore replacing the C3 backbone block with
+modern alternatives from 2018-2024 papers — keeping the coarse grid (P3
+cell 8x8, P4 cell 16x16) but enriching intra-cell representation, on the
+hypothesis that for small but **non-overlapping** objects (iarna profile),
+feature richness > grid density.
+
+iarna distance-to-nearest-neighbor analysis (verified):
+- min: 4.1 px, p1: 7.2 px, p5: 11.5 px, p10: 15.6 px, p25: 28.2 px, p50: 48.5 px
+- 134 pairs at < 16 px (P3/8 same-cell risk), 19 pairs at < 8 px (P2/4 risk)
+- Even with P3/8 grid, ~94% of objects have neighbors > 16 px → grid resolution is sufficient
+
+### Blocks added to `models/tf_common.py`
+All EdgeTPU-friendly by construction (no SE/attention):
+
+| Class | Paper | Year | Idea |
+|---|---|---|---|
+| `TFC2f` | YOLOv8 (Ultralytics) | 2023 | split + N bottlenecks chained, all concat — gradient flow ↑ |
+| `TFGELAN` | YOLOv9 (Wang et al) | 2024 | Generalized ELAN — pairs of bottlenecks, intermediate features collected |
+| `TFMSBlock` | YOLO-MS | 2023 | multi-kernel parallel (k=1, 3, 5) on channel chunks, concat |
+| `TFPConv` | FasterNet (CVPR 2023) | 2023 | partial conv on 1/4 channels, pass-through rest, +1×1 mix |
+| `TFGhost` | GhostNet (CVPR 2020) | 2020 | half features via 1×1, half via cheap DW on the half |
+| `TFCoordConvStem` | Liu et al (NeurIPS 2018) | 2018 | append normalized x/y grid before stem Conv |
+
+All wired into `parse_model_tf` (in `models/tf_yolo.py`) so any YAML can
+reference `C2f`, `GELAN`, `PConv`, `Ghost`, `MSBlock`, `CoordConv` as
+module names — same syntax as `Conv` / `C3`.
+
+### YAML variants created (all P3-P4 head, gw=0.125, na=1, nc=1)
+
+- [models/yolov5n_iarna_p3p4_c2f.yaml](models/yolov5n_iarna_p3p4_c2f.yaml)
+- [models/yolov5n_iarna_p3p4_gelan.yaml](models/yolov5n_iarna_p3p4_gelan.yaml)
+- [models/yolov5n_iarna_p3p4_msblock.yaml](models/yolov5n_iarna_p3p4_msblock.yaml)
+- [models/yolov5n_iarna_p3p4_pconv_ghost.yaml](models/yolov5n_iarna_p3p4_pconv_ghost.yaml)
+- [models/yolov5n_iarna_p3p4_coordconv.yaml](models/yolov5n_iarna_p3p4_coordconv.yaml)
+
+### Smoke test (1 epoch on iarna + EdgeTPU export 480x640 uint8)
+
+| # | Experiment | Params | TFLite KB | CPU ms | FPS | EdgeTPU TPU/total | Status |
+|---|---|---:|---:|---:|---:|---|---|
+| 0 | baseline (C3, w0125) | 119,924 | 195 | 8.8 | 113.5 | **145/145** | ✅ 100% TPU |
+| 1 | C2f (YOLOv8) | 129,780 | 202 | 9.7 | 103.6 | **135/135** | ✅ 100% TPU |
+| 2 | GELAN (YOLOv9) | 179,796 | 274 | 10.9 | 91.5 | **190/190** | ✅ 100% TPU |
+| 3 | **MSBlock** (YOLO-MS) | **67,022** | **130** | **8.7** | **115.3** | **126/126** | ✅ 100% TPU, **−44% params** |
+| 4 | PConv+Ghost (FasterNet+GhostNet) | 33,452 | 81 | 6.4 | 156.7 | — | ❌ EdgeTPU compile FAIL |
+| 5 | CoordConv stem (Liu 2018) | 120,068 | 797 | 9.9 | 101.2 | 1/147 | ❌ tile dynamic fragments partition (0% TPU effective) |
+
+All output footprints identical at 35 KiB (P3 60×80×6 + P4 30×40×6 = 36000 B)
+since the head is unchanged.
+
+### Findings
+1. **MSBlock is the standout small-objects-friendly variant**: same output
+   size, 44% fewer params, identical CPU latency, **100% TPU mapped**.
+   Multi-kernel (k=1, 3, 5) parallel branches give varied receptive fields
+   per branch — a natural fit for iarna's distribution (24 px median + tail
+   to 57 px).
+2. **C2f + GELAN are safe drop-ins** for C3: same partition behavior,
+   marginally more params (C2f) or significantly more (GELAN). Use them
+   if accuracy gain > extra params is documented; otherwise MSBlock wins
+   on the cost/benefit axis.
+3. **PConv+Ghost combination breaks the EdgeTPU compiler** entirely.
+   The interaction of PConv's channel-slice + Ghost's DepthwiseConv +
+   stride-2 chain produces a graph the compiler refuses. Standalone PConv
+   or standalone Ghost should be retried — the failure is the combination,
+   not either block alone.
+4. **CoordConv with dynamic-batch tile fragments partition** (only 1 op
+   on TPU). Fix would be to bake the grid into the input pre-processing on
+   host (lose trainable coord, but keep 100% TPU). Documented as anti-pattern
+   in `models/tf_common.py:TFCoordConvStem`.
+
+### Recommendation
+For real Edge TPU testing on iarna:
+1. **Train MSBlock 5-30 epochs** — first comparison vs C3 baseline on
+   actual mAP. If MSBlock matches or beats C3 mAP at half the params, this
+   is the architecture to commit to.
+2. **C2f / GELAN as fallbacks** if MSBlock underperforms — both stable,
+   100% TPU.
+3. Skip PConv+Ghost and CoordConv for deployment — keep only as research
+   notes.
+
+All 4 successfully-compiled artefacts (baseline + C2f + GELAN + MSBlock)
+are paired with their `*.yaml` and `architecture.json` in
+`runs/tf_native/iarna_p3p4_<variant>_1ep/export_uint8_480x640/`.
+
+---
+
 ## Update: Practical feature parity (A/B/C tier) — 2026-04-27
 
 User asked for a final pass to close the practical-impact gaps with PT.
